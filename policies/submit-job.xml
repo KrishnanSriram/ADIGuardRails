@@ -1,0 +1,28 @@
+<policies>
+  <inbound>
+    <base />
+    <set-backend-service base-url="{{adi-endpoint}}" />
+    <rewrite-uri template="/documentintelligence/documentModels/prebuilt-layout:analyze" copy-unmatched-params="false" />
+    <set-query-parameter name="api-version" exists-action="override"><value>2024-11-30</value></set-query-parameter>
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" client-id="{{umi-client-id}}" />
+  </inbound>
+  <backend><base /></backend>
+  <outbound>
+    <base />
+    <choose>
+      <when condition="@(context.Response.StatusCode == 202)">
+        <set-variable name="jobId" value="@{
+            var path = new Uri(context.Response.Headers.GetValueOrDefault("Operation-Location", "")).AbsolutePath;
+            return path.Substring(path.LastIndexOf('/') + 1);
+        }" />
+        <!-- Remember who created this job, so only they can read it -->
+        <cache-store-value key="@("job-" + (string)context.Variables["jobId"])"
+            value="@(((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("oid", ""))" duration="86400" />
+        <set-header name="Operation-Location" exists-action="delete" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>@(new JObject(new JProperty("jobId", (string)context.Variables["jobId"])).ToString())</set-body>
+      </when>
+    </choose>
+  </outbound>
+  <on-error><base /></on-error>
+</policies>

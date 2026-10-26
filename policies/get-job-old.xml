@@ -1,0 +1,12 @@
+<policies>
+  <inbound>
+    <base />
+    <set-backend-service base-url="{{adi-endpoint}}" />
+    <rewrite-uri template="/documentintelligence/documentModels/prebuilt-layout/analyzeResults/{jobId}" copy-unmatched-params="false" />
+    <set-query-parameter name="api-version" exists-action="override"><value>2024-11-30</value></set-query-parameter>
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" client-id="{{umi-client-id}}" />
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>

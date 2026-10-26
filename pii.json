@@ -1,0 +1,5 @@
+{"kind":"PiiEntityRecognition","parameters":{"modelVersion":"latest"},
+ "analysisInput":{"documents":[
+  {"id":"pii",  "language":"en","text":"Contact Jane Doe at jane.doe@contoso.com or 425-555-0100."},
+  {"id":"pci",  "language":"en","text":"Please charge card 4111 1111 1111 1111, exp 12/28."},
+  {"id":"clean","language":"en","text":"The quarterly report is attached for review."}]}}

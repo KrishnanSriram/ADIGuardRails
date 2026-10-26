@@ -1,0 +1,147 @@
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="jobId" value="@(context.Request.MatchedParameters["jobId"])" />
+
+    <!-- Reject anything that isn't a GUID -->
+    <choose>
+      <when condition="@(!System.Text.RegularExpressions.Regex.IsMatch((string)context.Variables["jobId"], "^[0-9a-fA-F-]{36}$"))">
+        <return-response><set-status code="400" reason="Invalid jobId" /></return-response>
+      </when>
+    </choose>
+
+    <!-- Only the caller who created the job can read it -->
+    <cache-lookup-value key="@("job-" + (string)context.Variables["jobId"])" variable-name="owner" default-value="" />
+    <choose>
+      <when condition="@((string)context.Variables["owner"] != ((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("oid", "x"))">
+        <return-response><set-status code="404" reason="Not found" /></return-response>
+      </when>
+    </choose>
+
+    <!-- 1. Fetch the extraction from Document Intelligence -->
+    <send-request mode="new" response-variable-name="adiResp" timeout="60">
+      <set-url>@("{{adi-endpoint}}/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" + (string)context.Variables["jobId"] + "?api-version=2024-11-30")</set-url>
+      <set-method>GET</set-method>
+      <authentication-managed-identity resource="https://cognitiveservices.azure.com" client-id="{{umi-client-id}}" />
+    </send-request>
+    <set-variable name="adiCode" value="@(((IResponse)context.Variables["adiResp"]).StatusCode)" />
+    <choose>
+      <when condition="@((int)context.Variables["adiCode"] != 200)">
+        <return-response><set-status code="@((int)context.Variables["adiCode"])" reason="Lookup failed" /></return-response>
+      </when>
+    </choose>
+    <set-variable name="adiBody" value="@(((IResponse)context.Variables["adiResp"]).Body.As<JObject>())" />
+    <set-variable name="adiStatus" value="@((string)((JObject)context.Variables["adiBody"])["status"])" />
+    <choose>
+      <when condition="@((string)context.Variables["adiStatus"] == "failed")">
+        <return-response><set-status code="502" reason="Extraction failed" /></return-response>
+      </when>
+      <when condition="@((string)context.Variables["adiStatus"] != "succeeded")">
+        <return-response>
+          <set-status code="202" reason="Still processing" />
+          <set-header name="Retry-After" exists-action="override"><value>5</value></set-header>
+          <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+          <set-body>@(new JObject(new JProperty("jobId", (string)context.Variables["jobId"]), new JProperty("status", (string)context.Variables["adiStatus"])).ToString())</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 2. Chunk the text on whitespace for the sync PII API (5 docs x ~5,120 chars max) -->
+    <set-variable name="piiRequest" value="@{
+        var content = (string)((JObject)context.Variables["adiBody"])["analyzeResult"]["content"] ?? "";
+        const int size = 5000;
+        var docs = new JArray();
+        int i = 0, n = 0;
+        while (i < content.Length) {
+            int end = Math.Min(i + size, content.Length);
+            if (end < content.Length) {
+                int ws = content.LastIndexOfAny(new[] { ' ', '\n', '\t' }, end - 1, end - i);
+                if (ws > i) { end = ws + 1; }
+            }
+            docs.Add(new JObject(
+                new JProperty("id", n.ToString()),
+                new JProperty("language", "en"),
+                new JProperty("text", content.Substring(i, end - i))));
+            i = end; n++;
+        }
+        return new JObject(
+            new JProperty("kind", "PiiEntityRecognition"),
+            new JProperty("parameters", new JObject(
+    new JProperty("modelVersion", "latest"),
+    new JProperty("piiCategories", new JArray(
+        "Person", "Email", "PhoneNumber", "Address", "USSocialSecurityNumber",
+        "USDriversLicenseNumber", "USBankAccountNumber", "IPAddress", "Age",
+        "CreditCardNumber", "InternationalBankingAccountNumber", "ABARoutingNumber")))),
+            new JProperty("analysisInput", new JObject(new JProperty("documents", docs)))
+        ).ToString();
+    }" />
+    <set-variable name="chunkCount" value="@(JObject.Parse((string)context.Variables["piiRequest"])["analysisInput"]["documents"].Count())" />
+    <choose>
+      <when condition="@((int)context.Variables["chunkCount"] == 0)">
+        <return-response>
+          <set-status code="200" reason="OK" />
+          <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+          <set-body>@(new JObject(new JProperty("jobId", (string)context.Variables["jobId"]), new JProperty("status", "completed"), new JProperty("content", "")).ToString())</set-body>
+        </return-response>
+      </when>
+      <when condition="@((int)context.Variables["chunkCount"] > 5)">
+        <return-response><set-status code="413" reason="Document too large for sync PII check" /></return-response>
+      </when>
+    </choose>
+
+    <!-- 3. Detect PII with Azure Language in Foundry -->
+    <send-request mode="new" response-variable-name="piiResp" timeout="60">
+      <set-url>{{language-endpoint}}/language/:analyze-text?api-version=2024-11-01</set-url>
+      <set-method>POST</set-method>
+      <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+      <set-body>@((string)context.Variables["piiRequest"])</set-body>
+      <authentication-managed-identity resource="https://cognitiveservices.azure.com" client-id="{{umi-client-id}}" />
+    </send-request>
+    <choose>
+      <when condition="@(((IResponse)context.Variables["piiResp"]).StatusCode != 200)">
+        <!-- Fail closed: never return unchecked text -->
+        <return-response><set-status code="502" reason="PII check unavailable" /></return-response>
+      </when>
+    </choose>
+    <set-variable name="piiDocs" value="@((JArray)((IResponse)context.Variables["piiResp"]).Body.As<JObject>()["results"]["documents"])" />
+
+    <!-- 4. Card data anywhere means block -->
+    <set-variable name="pciHit" value="@{
+        var pci = new[] { "CreditCardNumber" };
+        return ((JArray)context.Variables["piiDocs"])
+            .SelectMany(d => d["entities"])
+            .Any(e => pci.Contains((string)e["category"]));
+    }" />
+
+    <choose>
+      <when condition="@((bool)context.Variables["pciHit"])">
+        <return-response>
+          <set-status code="422" reason="Blocked" />
+          <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+          <set-body>@(new JObject(new JProperty("jobId", (string)context.Variables["jobId"]), new JProperty("status", "blocked"), new JProperty("reason", "Payment card data detected")).ToString())</set-body>
+        </return-response>
+      </when>
+      <otherwise>
+        <!-- 5. Otherwise return the redacted text -->
+        <return-response>
+          <set-status code="200" reason="OK" />
+          <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+          <set-body>@{
+              var docs = ((JArray)context.Variables["piiDocs"]).OrderBy(d => int.Parse((string)d["id"]));
+              var cats = docs.SelectMany(d => d["entities"]).Select(e => (string)e["category"]).Distinct().ToArray();
+              return new JObject(
+                  new JProperty("jobId", (string)context.Variables["jobId"]),
+                  new JProperty("status", "completed"),
+                  new JProperty("piiRedacted", cats.Length > 0),
+                  new JProperty("piiCategories", new JArray(cats)),
+                  new JProperty("content", string.Concat(docs.Select(d => (string)d["redactedText"])))
+              ).ToString();
+          }</set-body>
+        </return-response>
+      </otherwise>
+    </choose>
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>

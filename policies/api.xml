@@ -1,0 +1,14 @@
+<policies>
+  <inbound>
+    <base />
+    <validate-azure-ad-token tenant-id="{{tenant-id}}" output-token-variable-name="jwt">
+      <audiences>
+        <audience>api://{{api-app-id}}</audience>
+        <audience>{{api-app-id}}</audience>
+      </audiences>
+    </validate-azure-ad-token>
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>
